@@ -1,0 +1,22 @@
+{
+  "name": "crystal-visualizer",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "predeploy": "npm run build",    // 이 줄을 추가! (배포 전 자동으로 빌드)
+    "deploy": "gh-pages -d dist"     // 이 줄을 추가! (dist 폴더를 GitHub에 업로드)
+  },
+
+  "devDependencies": {
+    "gh-pages": "^6.3.0",
+    "vite": "^7.3.1"
+  },
+  "dependencies": {
+    "lil-gui": "^0.21.0",
+    "three": "^0.183.2"
+  }
+}
