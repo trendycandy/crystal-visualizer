@@ -54,7 +54,8 @@ const cameras = [
     new THREE.PerspectiveCamera(45, aspect, 0.1, 10000)
 ];
 
-cameras[0].position.set(100, 100, 100);
+// 초기 카메라 위치 조정
+cameras[0].position.set(80, 80, 80);
 cameras[1].position.set(-300, 200, 500);
 
 const ctrls = [
@@ -63,7 +64,6 @@ const ctrls = [
     new OrbitControls(cameras[2], document.getElementById('view3'))
 ];
 
-// 마우스 중앙 클릭(휠)으로 화면 이동(Pan) 지원
 ctrls.forEach(c => {
     c.enableDamping = true;
     c.mouseButtons = {
@@ -86,16 +86,39 @@ const groups = scenes.map(s => {
     return g;
 });
 
+// 최적화 변수
+let cachedSpots = [];
+let currentSpotMesh = null;
+let currentSpotData = [];
+let spotMesh1 = null;
+let spotMesh2 = null;
+
+const crystalGroup = new THREE.Group();
+groups[1].add(crystalGroup);
+
+// X선 빔 라인 고정
+const beamGeom = new THREE.BufferGeometry().setFromPoints([
+    new THREE.Vector3(-500, 0, 0),
+    new THREE.Vector3(500, 0, 0)
+]);
+const beamLine = new THREE.Line(beamGeom, new THREE.LineBasicMaterial({ color: 0xff0000, linewidth: 2 }));
+groups[1].add(beamLine);
+
+const detPlane = new THREE.Mesh(
+    new THREE.PlaneGeometry(600, 600),
+    new THREE.MeshBasicMaterial({ color: 0x333333, side: THREE.DoubleSide, transparent: true, opacity: 0.3 })
+);
+detPlane.rotation.y = Math.PI / 2;
+groups[1].add(detPlane);
+
 const params = {
     sgNumber: defaultSgNumber, a: 42.2, b: 42.2, c: 74.0, alpha: 90, beta: 104, gamma: 90,
-    omega: 0, chi: 0, phi: 0, wavelength: 1.54, detectorDist: 150,
+    omega: 0, chi: 0, phi: 0, wavelength: 0.9, detectorDist: 250,
     animateChi: false, blockScale: 3, threshold: 0.05
 };
 
 const raycaster = new THREE.Raycaster();
 const mouse = new THREE.Vector2();
-let currentSpotMesh = null;
-let currentSpotData = [];
 
 function parseXYZ(str) {
     const mat = [0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,1];
@@ -121,57 +144,48 @@ function parseXYZ(str) {
     return mat;
 }
 
-// --- 3. 렌더링 업데이트 로직 ---
-function updateAll() {
+const getSafeMatrix = (op) => {
+    let flatOp;
+    if (typeof op === 'string') {
+        flatOp = parseXYZ(op);
+    } else if (Array.isArray(op)) {
+        flatOp = op.flat(Infinity);
+    } else {
+        throw new Error("Invalid format");
+    }
+    if (flatOp.length !== 16) return new THREE.Matrix4();
+    return new THREE.Matrix4().fromArray(flatOp).transpose();
+};
+
+const getBasis = (rot, p) => {
+    const d2r = Math.PI / 180;
+    const v1 = new THREE.Vector3(p.a, 0, 0);
+    const v2 = new THREE.Vector3(p.b * Math.cos(p.gamma * d2r), p.b * Math.sin(p.gamma * d2r), 0);
+    const sinG = Math.sin(p.gamma * d2r);
+    const v3z = p.c * Math.sqrt(Math.max(0, 1 - Math.cos(p.alpha*d2r)**2 - Math.cos(p.beta*d2r)**2 - Math.cos(p.gamma*d2r)**2 + 2*Math.cos(p.alpha*d2r)*Math.cos(p.beta*d2r)*Math.cos(p.gamma*d2r))) / sinG;
+    const v3 = new THREE.Vector3(p.c * Math.cos(p.beta * d2r), p.c * (Math.cos(p.alpha * d2r) - Math.cos(p.beta * d2r) * Math.cos(p.gamma * d2r)) / sinG, v3z);
+    [v1, v2, v3].forEach(v => v.applyMatrix4(rot));
+    return { v1, v2, v3, mat: new THREE.Matrix4().makeBasis(v1, v2, v3) };
+};
+
+function buildLattice() {
     try {
-        groups.forEach(g => g.clear());
-        currentSpotData = [];
-        
+        groups[0].clear();
+        crystalGroup.clear();
+        cachedSpots = [];
+
         const sg = sgData[params.sgNumber];
-        if (!sg) throw new Error(`SG ${params.sgNumber} Not Found`);
+        if (!sg) return;
 
         document.getElementById('sg-name').innerText = sg.symbol_hm || `SG ${sg.number}`;
         document.getElementById('sg-system').innerText = sg.crystal_system || 'System';
 
-        const d2r = Math.PI / 180;
-        const mRot = new THREE.Matrix4().multiplyMatrices(
-            new THREE.Matrix4().makeRotationY(params.omega * d2r),
-            new THREE.Matrix4().makeRotationZ(params.chi * d2r)
-        ).multiply(new THREE.Matrix4().makeRotationX(params.phi * d2r));
-
-        const getBasis = (rot) => {
-            const v1 = new THREE.Vector3(params.a, 0, 0);
-            const v2 = new THREE.Vector3(params.b * Math.cos(params.gamma * d2r), params.b * Math.sin(params.gamma * d2r), 0);
-            const sinG = Math.sin(params.gamma * d2r);
-            const v3z = params.c * Math.sqrt(Math.max(0, 1 - Math.cos(params.alpha*d2r)**2 - Math.cos(params.beta*d2r)**2 - Math.cos(params.gamma*d2r)**2 + 2*Math.cos(params.alpha*d2r)*Math.cos(params.beta*d2r)*Math.cos(params.gamma*d2r))) / sinG;
-            const v3 = new THREE.Vector3(params.c * Math.cos(params.beta * d2r), params.c * (Math.cos(params.alpha * d2r) - Math.cos(params.beta * d2r) * Math.cos(params.gamma * d2r)) / sinG, v3z);
-            [v1, v2, v3].forEach(v => v.applyMatrix4(rot));
-            return { v1, v2, v3, mat: new THREE.Matrix4().makeBasis(v1, v2, v3) };
-        };
-
-        const bReal = getBasis(new THREE.Matrix4());
-        const bRecip = getBasis(mRot);
-
+        const bReal = getBasis(new THREE.Matrix4(), params);
         const atomRadius = 1.5; 
         const atomGeom = new THREE.SphereGeometry(atomRadius, 16, 16);
         const atomMat = new THREE.MeshPhongMaterial({ color: 0x4488ff });
-
-        const getSafeMatrix = (op) => {
-            let flatOp;
-            if (typeof op === 'string') {
-                flatOp = parseXYZ(op);
-            } else if (Array.isArray(op)) {
-                flatOp = op.flat(Infinity);
-            } else {
-                throw new Error("Invalid format");
-            }
-            if (flatOp.length !== 16) return new THREE.Matrix4();
-            return new THREE.Matrix4().fromArray(flatOp).transpose();
-        };
-
         const opsList = sg.operations || sg.symops || [ "x,y,z" ];
 
-        // 3.1 View 1 (Unit Cell)
         const unitMesh = new THREE.InstancedMesh(atomGeom, atomMat, opsList.length);
         opsList.forEach((op, i) => {
             const mat = getSafeMatrix(op);
@@ -187,171 +201,154 @@ function updateAll() {
         const addL = (i, j) => groups[0].add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([pts[i], pts[j]]), lineMat));
         [[0,1],[1,2],[2,3],[3,0],[4,5],[5,6],[6,7],[7,4],[0,4],[1,5],[2,6],[3,7]].forEach(p => addL(p[0], p[1]));
 
-        // 3.2 View 2 (Crystal Block)
         const n = params.blockScale;
         const blockMesh = new THREE.InstancedMesh(atomGeom, atomMat, opsList.length * (n**3));
         let bIdx = 0;
-        const offset = new THREE.Vector3((n-1)/2, (n-1)/2, (n-1)/2).applyMatrix4(bRecip.mat);
+        const offset = new THREE.Vector3((n-1)/2, (n-1)/2, (n-1)/2).applyMatrix4(bReal.mat);
         for(let i=0; i<n; i++) for(let j=0; j<n; j++) for(let k=0; k<n; k++) {
-            const cPos = new THREE.Vector3(i,j,k).applyMatrix4(bRecip.mat).sub(offset);
+            const cPos = new THREE.Vector3(i,j,k).applyMatrix4(bReal.mat).sub(offset);
             opsList.forEach(op => {
                 const mat = getSafeMatrix(op);
                 const fPos = new THREE.Vector4(0,0,0,1).applyMatrix4(mat);
-                const pos = new THREE.Vector3(fPos.x, fPos.y, fPos.z).applyMatrix4(bRecip.mat).add(cPos);
+                const pos = new THREE.Vector3(fPos.x, fPos.y, fPos.z).applyMatrix4(bReal.mat).add(cPos);
                 blockMesh.setMatrixAt(bIdx++, new THREE.Matrix4().makeTranslation(pos.x, pos.y, pos.z));
             });
         }
         blockMesh.instanceMatrix.needsUpdate = true;
-        groups[1].add(blockMesh);
+        crystalGroup.add(blockMesh);
 
-        // 빔 & 검출기 가시화
-        const k_mag = 2 * Math.PI / params.wavelength;
-        const ewaldCenter = new THREE.Vector3(-k_mag, 0, 0);
-        groups[1].add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(-500,0,0), new THREE.Vector3(params.detectorDist,0,0)]), new THREE.LineBasicMaterial({color: 0xff0000})));
-        
-        const detPlane = new THREE.Mesh(new THREE.PlaneGeometry(600, 600), new THREE.MeshBasicMaterial({ color: 0x333333, side: THREE.DoubleSide, transparent: true, opacity: 0.3 }));
-        detPlane.position.x = params.detectorDist;
-        detPlane.rotation.y = Math.PI/2;
-        groups[1].add(detPlane);
-
-        // 3.3 View 3 Diffraction Pattern & View 2 Spots
-        const vol = Math.abs(bRecip.v1.dot(new THREE.Vector3().crossVectors(bRecip.v2, bRecip.v3)));
+        const vol = Math.abs(bReal.v1.dot(new THREE.Vector3().crossVectors(bReal.v2, bReal.v3)));
         const rV = [
-            new THREE.Vector3().crossVectors(bRecip.v2, bRecip.v3).multiplyScalar(2 * Math.PI / vol),
-            new THREE.Vector3().crossVectors(bRecip.v3, bRecip.v1).multiplyScalar(2 * Math.PI / vol),
-            new THREE.Vector3().crossVectors(bRecip.v1, bRecip.v2).multiplyScalar(2 * Math.PI / vol)
+            new THREE.Vector3().crossVectors(bReal.v2, bReal.v3).multiplyScalar(2 * Math.PI / vol),
+            new THREE.Vector3().crossVectors(bReal.v3, bReal.v1).multiplyScalar(2 * Math.PI / vol),
+            new THREE.Vector3().crossVectors(bReal.v1, bReal.v2).multiplyScalar(2 * Math.PI / vol)
         ];
 
-        // 해상도 0.5 Å로 완전 고정 처리
-        const RESOLUTION_LIMIT = 0.8;
+        const RESOLUTION_LIMIT = 0.5;
         const max_G = (2 * Math.PI) / RESOLUTION_LIMIT;
-
         let h_max = Math.ceil(max_G / rV[0].length());
         let k_max = Math.ceil(max_G / rV[1].length());
         let l_max = Math.ceil(max_G / rV[2].length());
 
-        // 성능 저하를 막기 위한 최대 인덱스 탐색 제한
-        const MAX_IDX = 40; 
+        const MAX_IDX = 35; 
         h_max = Math.min(h_max, MAX_IDX);
         k_max = Math.min(k_max, MAX_IDX);
         l_max = Math.min(l_max, MAX_IDX);
 
-        const maxSpots = (h_max * 2 + 1) * (k_max * 2 + 1) * (l_max * 2 + 1);
-        const spotGeom = new THREE.CircleGeometry(1.5, 16);
-        const spotMat = new THREE.MeshBasicMaterial({ color: 0xffff00, side: THREE.DoubleSide });
-        
-        const spotMesh = new THREE.InstancedMesh(spotGeom, spotMat, maxSpots);
-        const spotMesh2 = new THREE.InstancedMesh(spotGeom, spotMat, maxSpots);
-        
-        let sIdx = 0;
-        const hide = new THREE.Matrix4().makeScale(0,0,0);
         const dummyAtom = new THREE.Vector3(0.12, 0.25, 0.38);
 
         for (let h = -h_max; h <= h_max; h++) {
             for (let k = -k_max; k <= k_max; k++) {
                 for (let l = -l_max; l <= l_max; l++) {
-                    if (h===0 && k===0 && l===0) { 
-                        spotMesh.setMatrixAt(sIdx, hide); 
-                        spotMesh2.setMatrixAt(sIdx, hide);
-                        sIdx++; 
-                        continue; 
+                    if (h===0 && k===0 && l===0) continue; 
+                    const G_unrot = new THREE.Vector3().addScaledVector(rV[0], h).addScaledVector(rV[1], k).addScaledVector(rV[2], l);
+                    if (G_unrot.length() > max_G) continue;
+
+                    let F_real = 0;
+                    let F_imag = 0;
+                    opsList.forEach(op => {
+                        const mat = getSafeMatrix(op);
+                        const fPos = new THREE.Vector4(dummyAtom.x, dummyAtom.y, dummyAtom.z, 1).applyMatrix4(mat);
+                        const phase = 2 * Math.PI * (h * fPos.x + k * fPos.y + l * fPos.z);
+                        F_real += Math.cos(phase);
+                        F_imag += Math.sin(phase);
+                    });
+                    const intensity = (F_real**2 + F_imag**2) / opsList.length;
+                    if (intensity > 0.1) {
+                        const scale = Math.max(0.3, Math.log10(intensity + 1.5));
+                        cachedSpots.push({ h, k, l, G_unrot, scale });
                     }
-
-                    const G = new THREE.Vector3().addScaledVector(rV[0], h).addScaledVector(rV[1], k).addScaledVector(rV[2], l);
-                    
-                    // 물리적인 구형 한계(Spherical cutoff) 적용
-                    if (G.length() > max_G) {
-                        spotMesh.setMatrixAt(sIdx, hide); 
-                        spotMesh2.setMatrixAt(sIdx, hide);
-                        sIdx++; 
-                        continue;
-                    }
-
-                    if (Math.abs(G.distanceTo(ewaldCenter) - k_mag) < params.threshold) {
-                        
-                        let F_real = 0;
-                        let F_imag = 0;
-                        opsList.forEach(op => {
-                            const mat = getSafeMatrix(op);
-                            const fPos = new THREE.Vector4(dummyAtom.x, dummyAtom.y, dummyAtom.z, 1).applyMatrix4(mat);
-                            const phase = 2 * Math.PI * (h * fPos.x + k * fPos.y + l * fPos.z);
-                            F_real += Math.cos(phase);
-                            F_imag += Math.sin(phase);
-                        });
-                        
-                        const intensity = (F_real**2 + F_imag**2) / opsList.length;
-
-                        if (intensity > 0.1) {
-                            const k_out = new THREE.Vector3(k_mag, 0, 0).add(G).normalize();
-                            if (k_out.x > 0) {
-                                const p = params.detectorDist / k_out.x;
-                                const sP = k_out.multiplyScalar(p);
-                                const scale = Math.max(0.3, Math.log10(intensity + 1.5));
-                                const transform = new THREE.Matrix4()
-                                    .makeTranslation(params.detectorDist, sP.y, sP.z)
-                                    .multiply(new THREE.Matrix4().makeRotationY(Math.PI/2))
-                                    .multiply(new THREE.Matrix4().makeScale(scale, scale, scale));
-                                
-                                spotMesh.setMatrixAt(sIdx, transform);
-                                spotMesh2.setMatrixAt(sIdx, transform);
-
-                                const sinTheta = Math.min(1, G.length() / (2 * k_mag));
-                                const theta2 = 2 * Math.asin(sinTheta) * (180 / Math.PI);
-                                
-                                currentSpotData[sIdx] = { h, k, l, theta2 };
-                            } else {
-                                spotMesh.setMatrixAt(sIdx, hide);
-                                spotMesh2.setMatrixAt(sIdx, hide);
-                            }
-                        } else {
-                            spotMesh.setMatrixAt(sIdx, hide);
-                            spotMesh2.setMatrixAt(sIdx, hide);
-                        }
-                    } else {
-                        spotMesh.setMatrixAt(sIdx, hide);
-                        spotMesh2.setMatrixAt(sIdx, hide);
-                    }
-                    sIdx++;
                 }
             }
         }
-        spotMesh.instanceMatrix.needsUpdate = true;
-        spotMesh2.instanceMatrix.needsUpdate = true;
-        
-        groups[2].add(spotMesh);
-        groups[1].add(spotMesh2);
-        
-        currentSpotMesh = spotMesh;
-        
-        cameras[2].position.set(params.detectorDist + 350, 0, 0);
-        cameras[2].lookAt(params.detectorDist, 0, 0);
 
-    } catch (e) {
-        console.error("데이터 계산 중 에러 발생:", e);
-        document.getElementById('sg-name').innerText = "Data Format Error";
-        document.getElementById('sg-system').innerText = "Check Console (F12)";
-    }
+        if (spotMesh1) groups[2].remove(spotMesh1);
+        if (spotMesh2) groups[1].remove(spotMesh2);
+
+        const safeCount = Math.max(1, cachedSpots.length);
+        const spotGeom = new THREE.CircleGeometry(1.5, 16);
+        const spotMat = new THREE.MeshBasicMaterial({ color: 0xffff00, side: THREE.DoubleSide });
+        
+        spotMesh1 = new THREE.InstancedMesh(spotGeom, spotMat, safeCount);
+        spotMesh2 = new THREE.InstancedMesh(spotGeom, spotMat, safeCount);
+        
+        groups[2].add(spotMesh1);
+        groups[1].add(spotMesh2);
+        currentSpotMesh = spotMesh1;
+
+        // 누락되었던 초기 호출 추가
+        updateExperiment();
+    } catch (e) { console.error(e); }
 }
 
-// --- 마우스 호버 이벤트 (Raycaster) ---
+function updateExperiment() {
+    if (!spotMesh1 || !spotMesh2) return;
+
+    const d2r = Math.PI / 180;
+    const mRot = new THREE.Matrix4().multiplyMatrices(
+        new THREE.Matrix4().makeRotationY(params.omega * d2r),
+        new THREE.Matrix4().makeRotationZ(params.chi * d2r)
+    ).multiply(new THREE.Matrix4().makeRotationX(params.phi * d2r));
+
+    crystalGroup.setRotationFromMatrix(mRot);
+
+    const k_mag = 2 * Math.PI / params.wavelength;
+    const ewaldCenter = new THREE.Vector3(-k_mag, 0, 0);
+    detPlane.position.x = params.detectorDist;
+
+    let sIdx = 0;
+    const hide = new THREE.Matrix4().makeScale(0,0,0);
+    currentSpotData = [];
+
+    for (let i = 0; i < cachedSpots.length; i++) {
+        const spot = cachedSpots[i];
+        const G_rot = spot.G_unrot.clone().applyMatrix4(mRot);
+
+        // Spot Tolerance (거리 기반)
+        if (Math.abs(G_rot.distanceTo(ewaldCenter) - k_mag) < params.threshold) {
+            const k_out = new THREE.Vector3(k_mag, 0, 0).add(G_rot).normalize();
+            if (k_out.x > 0) {
+                const p = params.detectorDist / k_out.x;
+                const sP = k_out.multiplyScalar(p);
+                const transform = new THREE.Matrix4()
+                    .makeTranslation(params.detectorDist, sP.y, sP.z)
+                    .multiply(new THREE.Matrix4().makeRotationY(Math.PI/2))
+                    .multiply(new THREE.Matrix4().makeScale(spot.scale, spot.scale, spot.scale));
+                
+                spotMesh1.setMatrixAt(sIdx, transform);
+                spotMesh2.setMatrixAt(sIdx, transform);
+                const sinTheta = Math.min(1, G_rot.length() / (2 * k_mag));
+                const theta2 = 2 * Math.asin(sinTheta) * (180 / Math.PI);
+                currentSpotData[sIdx] = { h: spot.h, k: spot.k, l: spot.l, theta2 };
+                sIdx++;
+            }
+        }
+    }
+
+    for (let i = sIdx; i < Math.max(1, cachedSpots.length); i++) {
+        spotMesh1.setMatrixAt(i, hide);
+        spotMesh2.setMatrixAt(i, hide);
+    }
+
+    spotMesh1.instanceMatrix.needsUpdate = true;
+    spotMesh2.instanceMatrix.needsUpdate = true;
+    cameras[2].position.set(params.detectorDist + 350, 0, 0);
+    cameras[2].lookAt(params.detectorDist, 0, 0);
+}
+
 window.addEventListener('mousemove', (event) => {
     if (!currentSpotMesh) return;
-
     const w = window.innerWidth;
     const view3Left = w * (4 / 7);
     const view3Width = w * (2 / 7);
-    
     if (event.clientX >= view3Left && event.clientX <= view3Left + view3Width) {
         mouse.x = ((event.clientX - view3Left) / view3Width) * 2 - 1;
         mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
-
         raycaster.setFromCamera(mouse, cameras[2]);
         const intersects = raycaster.intersectObject(currentSpotMesh);
-
         if (intersects.length > 0) {
             const instanceId = intersects[0].instanceId;
             const data = currentSpotData[instanceId];
-            
             if (data) {
                 tooltip.style.display = 'block';
                 tooltip.style.left = event.clientX + 15 + 'px';
@@ -364,16 +361,10 @@ window.addEventListener('mousemove', (event) => {
     tooltip.style.display = 'none';
 });
 
-// --- 4. 렌더링 루프 ---
 function animate() {
     requestAnimationFrame(animate);
     ctrls.forEach(c => c.update());
-    
-    if (params.animateChi) { 
-        params.chi = (params.chi + 0.4) % 360; 
-        updateAll(); 
-    }
-    
+    if (params.animateChi) { params.chi = (params.chi + 0.4) % 360; updateExperiment(); }
     const w = window.innerWidth, h = window.innerHeight;
     const unit = w / 7;
     renderer.clear();
@@ -388,35 +379,26 @@ function animate() {
 window.addEventListener('resize', () => {
     renderer.setSize(window.innerWidth, window.innerHeight);
     const aspect = (window.innerWidth / 7 * 2) / window.innerHeight;
-    cameras.forEach((c) => { 
-        c.aspect = aspect; 
-        c.updateProjectionMatrix(); 
-    });
+    cameras.forEach((c) => { c.aspect = aspect; c.updateProjectionMatrix(); });
     gui.domElement.style.width = `${window.innerWidth / 7}px`;
 });
 
-// --- 5. GUI 설정 ---
 const gui = new GUI({ container: document.getElementById('gui-container'), width: window.innerWidth / 7 });
 const f1 = gui.addFolder('Lattice & SG');
-
 const sgOptions = {};
-keys.forEach(key => {
-    const sg = sgData[key];
-    sgOptions[`${sg.number}: ${sg.symbol_hm || 'Unknown'}`] = Number(key);
-});
-
-f1.add(params, 'sgNumber', sgOptions).name('Space Group').onChange(updateAll);
-['a','b','c','alpha','beta','gamma'].forEach(v => f1.add(params, v, 10, 100).onChange(updateAll));
-f1.add(params, 'blockScale', 1, 7, 1).name('Crystal Size').onChange(updateAll);
+keys.forEach(key => { const sg = sgData[key]; sgOptions[`${sg.number}: ${sg.symbol_hm || 'Unknown'}`] = Number(key); });
+f1.add(params, 'sgNumber', sgOptions).name('Space Group').onChange(buildLattice);
+['a','b','c','alpha','beta','gamma'].forEach(v => f1.add(params, v, 10, 300).onChange(buildLattice));
+f1.add(params, 'blockScale', 1, 7, 1).name('Crystal Size').onChange(buildLattice);
 
 const f2 = gui.addFolder('Goniometer (Rotation)');
-['omega','chi','phi'].forEach(v => f2.add(params, v, -180, 180).listen().onChange(updateAll));
+['omega','chi','phi'].forEach(v => f2.add(params, v, -180, 180).listen().onChange(updateExperiment));
 f2.add(params, 'animateChi').name('Auto-rotate Chi');
 
 const f3 = gui.addFolder('Experiment');
-f3.add(params, 'wavelength', 0.5, 3).name('X-ray λ (Å)').onChange(updateAll);
-f3.add(params, 'detectorDist', 50, 400).name('Detector Dist').onChange(updateAll);
-f3.add(params, 'threshold', 0.01, 0.5).name('Mosaicity').onChange(updateAll); 
+f3.add(params, 'wavelength', 0.5, 3).name('X-ray λ (Å)').onChange(updateExperiment);
+f3.add(params, 'detectorDist', 50, 400).name('Detector Dist').onChange(updateExperiment);
+f3.add(params, 'threshold', 0.05, 0.5).step(0.001).name('Spot Tolerance').onChange(updateExperiment);
 
-updateAll();
+buildLattice();
 animate();
